@@ -1,0 +1,85 @@
+# 1) extract
+python main.py extract --indir data/pcap --out data/jsonl/http.jsonl
+
+# 2) label
+python main.py label --infile data/jsonl/http.jsonl --rule heuristics --out data/jsonl/http_labeled.jsonl
+
+# 3) train
+python main.py train --data data/jsonl/http_labeled.jsonl \
+  --models xgb,logreg,svm_linear,svm_rbf,decision_tree,random_forest,extra_trees,knn,gaussiannb,multinomialnb,complementnb,bernoullinb,lda,qda,mlp \
+  --svd_components 768
+
+# 4) calibrate (safe loop)
+
+for f in data/models/*.joblib data/models/*.json; do
+  base=$(basename "$f")
+  case "$base" in
+    tfidf_cuml.joblib|tsvd_cuml.joblib) continue ;; 
+  esac
+  name="${base%.*}"
+  python main.py calibrate \
+    --data data/jsonl/http_labeled.jsonl \
+    --model "$f" \
+    --min_recall 1.0 \
+    --out "conf/${name}.yaml"
+done
+
+
+# 5) single-model report
+python main.py report --data data/jsonl/http_labeled.jsonl --cfg conf/xgb.yaml
+
+5.1) for all ensemble model repot
+CFG_LIST="conf/xgb.yaml,conf/svm_rbf.yaml,conf/multinomialnb.yaml"
+
+
+python main.py ensemble_report \
+  --data data/jsonl/http_labeled.jsonl \
+  --cfgs "$CFG_LIST" \
+  --mode or
+
+# 6) compare (all YAMLs)
+python main.py compare \
+  --data data/jsonl/http_labeled.jsonl \
+  --cfgs "$(ls conf/*.yaml | paste -sd, -)" \
+  --out_json reports/model_comparison.json \
+  --out_png reports/model_comparison.png \
+  --out_png_rank reports/model_comparison_rank.png
+
+
+
+# 8) APIs
+sudo pkill uvicorn
+(ml_prefilter) nilesh@gdrlab-host02:~/Documents/ml_prefilter$ python main.py serve_ensemble \
+  --cfgs conf/xgb.yaml,conf/svm_rbf.yaml,conf/multinomialnb.yaml \
+  --mode or --host 127.0.0.1 --port 9009
+
+
+
+curl -k https://10.0.1.60/
+curl -k "https://10.0.1.60/?q=<script>alert(1)</script>"
+
+
+
+Benchmarking 
+wrk -t32 -c2000 -d30s --latency \
+  -H 'X-Orig-Method: GET' \
+  -H 'X-Orig-Host: 10.0.1.60' \
+  -H 'X-Orig-URI: /?q=<script>alert(1)</script>' \
+  -H 'X-Orig-UA: wrk' \
+  http://127.0.0.1:9009/auth_headers_403
+
+
+Logs and monitoring
+
+LOG=/var/log/nginx/prefilter_access.log
+TOTAL=$(wc -l < "$LOG")
+BLOCK=$(grep -Ec '403|X-Prefilter-Suspicious: 1|sus:1' "$LOG")
+ALLOW=$(( TOTAL - BLOCK ))
+awk -v t=$TOTAL -v a=$ALLOW 'BEGIN{printf("reduction≈%.1fx\n", t/a)}'
+
+
+
+
+jq -r '.label' data/jsonl/http_labeled.jsonl | sort | uniq -c
+
+
